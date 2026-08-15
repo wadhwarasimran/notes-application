@@ -1,0 +1,98 @@
+name: ci
+
+# On every push to main this workflow does FOUR things:
+#   1. build the image
+#   2. smoke-test it            <- the GATE: a broken image is never published
+#   3. push it to GHCR, tagged with the commit SHA
+#   4. write that new tag into the notes-gitops repo   <- THE HANDOFF to CD
+#
+# Step 4 is the deploy. Argo CD watches notes-gitops, sees the new commit, and
+# syncs the cluster. Notice what this workflow does NOT have: any cluster
+# credentials. It never talks to Kubernetes at all — it only writes to Git.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:          # lets you trigger a run by hand from the Actions tab
+
+env:
+  # NB: deliberately NOT "notes-api". GHCR ties a package to the repo that first
+  # published it, so if you already pushed ghcr.io/<you>/notes-api from the CI
+  # lecture's template repo, THIS repo would be refused with
+  #   denied: permission_denied: write_package
+  # A distinct package name avoids that entirely.
+  IMAGE_NAME: notes-application            # the image this repo publishes
+  GITOPS_REPO: notes-gitops                # the repo that describes what RUNS
+  MANIFEST: apps/notes-api/deployment.yaml # the file in that repo holding the image tag
+
+permissions:
+  contents: read              # read THIS repo
+  packages: write             # push to GHCR (ghcr.io/<you>/notes-api)
+
+jobs:
+  build-test-push-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Work out the image path
+        # GHCR requires the owner to be LOWERCASE, but GitHub keeps your original
+        # casing — ${VAR,,} is the bash trick that lowercases it. Forget it and the
+        # push fails with a confusing error.
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+
+      - name: Build the image
+        run: docker build -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:latest" .
+
+      - name: Smoke-test the image before publishing
+        # Run the container and prove the app answers BEFORE anything is pushed.
+        # If this fails the job stops here and nothing is published — that's the gate.
+        run: |
+          docker run -d --rm --name smoke -p 8080:8080 "$IMAGE:$GITHUB_SHA"
+          for _ in $(seq 1 20); do
+            curl -fsS http://localhost:8080/healthz >/dev/null && break || sleep 1
+          done
+          curl -fsS http://localhost:8080/healthz
+          curl -fsS http://localhost:8080/ready
+          docker stop smoke
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push both tags
+        # <sha> is IMMUTABLE — it means exactly this code, forever. That's what we deploy.
+        # latest is a moving pointer: convenient, but never deploy it to production.
+        run: |
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:latest"
+
+      # ─────────────── THE HANDOFF: CI ends, CD begins ───────────────
+      # GITHUB_TOKEN only works on THIS repo, so writing to notes-gitops needs its own
+      # credential: GITOPS_TOKEN, a fine-grained PAT with `contents: write` on that repo.
+      # Add it under Settings → Secrets and variables → Actions.
+      - name: Check out the GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Write the new image tag into the GitOps repo (this IS the deploy)
+        working-directory: gitops
+        run: |
+          # Match ANY ghcr.io image line, not just this image name: the manifest ships
+          # pointing at the course's public image so the first sync works, and this is
+          # the commit that switches it to YOURS.
+          sed -i -E "s#(image: )ghcr\.io/.*#\1${IMAGE}:${GITHUB_SHA}#" "$MANIFEST"
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git add "$MANIFEST"
+          if git diff --cached --quiet; then
+            echo "image tag unchanged — nothing to deploy"; exit 0
+          fi
+          git commit -m "deploy ${IMAGE_NAME}:${GITHUB_SHA}"
+          git push
+          echo "### Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "Wrote \`${IMAGE}:${GITHUB_SHA}\` into **${GITOPS_REPO}/${MANIFEST}**." >> "$GITHUB_STEP_SUMMARY"
+          echo "Argo CD will pick it up and sync the cluster." >> "$GITHUB_STEP_SUMMARY"
