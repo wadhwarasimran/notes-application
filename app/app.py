@@ -130,7 +130,7 @@ def admin_break():
 def root():
     if GREETING:
         return f"{GREETING} — try GET /notes\n"
-    return "notes-api — try GET /notes or POST /notes with, this is to test {\"text\":\"...\"}\n"
+    return "notes-api — try GET /notes or POST /notes with, this is to test on simran's repo{\"text\":\"...\"}\n"
 
 
 
