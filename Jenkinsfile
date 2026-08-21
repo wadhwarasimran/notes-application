@@ -12,7 +12,7 @@ pipeline {
         // Actions had ${GITHUB_REPOSITORY_OWNER,,} for free. Jenkins has never
         // heard of GitHub, so you supply it — and lowercase matters: GHCR refuses
         // capitals in the owner segment.
-        OWNER = 'sohamkaralkar'
+        OWNER = 'wadhwarasimran'
 
         // Deliberately NOT "notes-api". GHCR ties a package to the repo that first
         // published it, so reusing the CI lecture's package name gets you
